@@ -5,11 +5,11 @@
 <title>AI Engine</title>
 <style>
   html,body{margin:0;height:100%;background:#0b1226;color:#8ea6cf;font:11px "Segoe UI",Arial,sans-serif;}
-  #s{padding:6px;word-break:break-word;}
+  #s{padding:6px 6px 2px;word-break:break-word;line-height:1.35;} #d{padding:0 6px;color:#5fd8ff;word-break:break-all;line-height:1.35;font-size:10px;}
 </style>
 </head>
 <body>
-<div id="s">Engine page loaded. Waiting for Transformers.js…</div>
+<div id="s">Engine page loaded.</div><div id="d"></div>
 <!-- 1) classic script: installs the message listener FIRST, so a message can never arrive before a listener exists -->
 <script>
 /* AI Image Studio - engine core.
@@ -344,7 +344,15 @@
 <script>
   console.log('[ENGINE] script loaded');
   var statusEl = document.getElementById('s');
-  function setStatus(t) { statusEl.textContent = t; }
+  var lines = [];
+  function setStatus(t) { lines.push(t); if (lines.length > 5) lines.shift(); statusEl.textContent = lines.join('\n'); statusEl.style.whiteSpace = 'pre-wrap'; }
+  // Live probe of what this WebView actually provides (read this in Settings > Enlarge engine view).
+  function probe() {
+    var keys = []; try { keys = Object.keys(window).filter(function (k) { return /uxp|host|adobe|premiere|bridge/i.test(k); }); } catch (e) {}
+    document.getElementById('d').textContent = 'uxpHost: ' + typeof window.uxpHost + (window.uxpHost ? ' postMessage: ' + typeof window.uxpHost.postMessage : '') +
+      ' | parent===self: ' + (window.parent === window) + ' | keys: ' + (keys.join(',') || '-') + ' | url: ' + location.href.slice(0, 50);
+  }
+  setInterval(probe, 1000); probe();
 
   // Library loading is asynchronous and separate from messaging: if the CDN import fails,
   // the engine still answers with a precise error instead of staying silent.
