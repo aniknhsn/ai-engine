@@ -1,0 +1,385 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>AI Engine</title>
+<style>
+  html,body{margin:0;height:100%;background:#0b1226;color:#8ea6cf;font:11px "Segoe UI",Arial,sans-serif;}
+  #s{padding:6px;word-break:break-word;}
+</style>
+</head>
+<body>
+<div id="s">Engine page loaded. Waiting for Transformers.js…</div>
+<!-- 1) classic script: installs the message listener FIRST, so a message can never arrive before a listener exists -->
+<script>
+/* AI Image Studio - engine core.
+ * Runs inside the engine WebView (engine.html) AND inside test-harness/ with the SAME code.
+ * It knows nothing about Premiere: it receives messages via handle() and answers via cfg.send().
+ * Every outgoing message carries a requestId. */
+(function (root, factory) {
+  if (typeof module === 'object' && module.exports) module.exports = factory(root);
+  else root.AIS_ENGINE_CORE = factory(root);
+})(typeof self !== 'undefined' ? self : this, function (root) {
+  'use strict';
+
+  var CHUNK_RAW = 3 * 128 * 1024; // multiple of 3 so base64 chunks concatenate cleanly
+  var PRIORITY = ['logits', 'output', 'output_image', 'pred', 'mask', 'masks'];
+  var B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+  var B64R = null;
+
+  function b64encode(u8) {
+    var out = [], i = 0, n = u8.length, a, b, c;
+    for (; i + 2 < n; i += 3) {
+      a = u8[i]; b = u8[i + 1]; c = u8[i + 2];
+      out.push(B64[a >> 2] + B64[((a & 3) << 4) | (b >> 4)] + B64[((b & 15) << 2) | (c >> 6)] + B64[c & 63]);
+    }
+    if (i < n) {
+      a = u8[i]; b = i + 1 < n ? u8[i + 1] : 0;
+      out.push(B64[a >> 2] + B64[((a & 3) << 4) | (b >> 4)] + (i + 1 < n ? B64[(b & 15) << 2] : '=') + '=');
+    }
+    return out.join('');
+  }
+  function b64decode(str) {
+    if (!B64R) { B64R = new Int16Array(128).fill(-1); for (var k = 0; k < 64; k++) B64R[B64.charCodeAt(k)] = k; }
+    var len = str.length, pad = str.charAt(len - 1) === '=' ? (str.charAt(len - 2) === '=' ? 2 : 1) : 0;
+    var out = new Uint8Array((len / 4) * 3 - pad), o = 0, v = [0, 0, 0, 0];
+    for (var i = 0; i < len; i += 4) {
+      for (var j = 0; j < 4; j++) { var ch = str.charCodeAt(i + j); v[j] = ch === 61 ? 0 : B64R[ch]; if (v[j] < 0) throw new Error('Invalid base64 payload'); }
+      var w = (v[0] << 18) | (v[1] << 12) | (v[2] << 6) | v[3];
+      if (o < out.length) out[o++] = (w >> 16) & 255;
+      if (o < out.length) out[o++] = (w >> 8) & 255;
+      if (o < out.length) out[o++] = w & 255;
+    }
+    return out;
+  }
+
+  function sniffMime(b) {
+    if (b[0] === 0x89 && b[1] === 0x50) return 'image/png';
+    if (b[0] === 0xFF && b[1] === 0xD8) return 'image/jpeg';
+    if (b[0] === 0x42 && b[1] === 0x4D) return 'image/bmp';
+    if (b[0] === 0x52 && b[1] === 0x49 && b[8] === 0x57) return 'image/webp';
+    if ((b[0] === 0x49 && b[1] === 0x49) || (b[0] === 0x4D && b[1] === 0x4D)) return 'image/tiff';
+    return 'application/octet-stream';
+  }
+
+  // ---- tensor helpers -------------------------------------------------------
+  function isTensor(o) {
+    return !!o && typeof o === 'object' && Array.isArray(o.dims) && o.dims.length > 0 &&
+      (typeof o.getData === 'function' || (function () { try { return o.data && typeof o.data.length === 'number'; } catch (e) { return false; } })());
+  }
+  // Recursive search: never assumes outputs.logits exists.
+  function findTensor(o, path, depth, seen) {
+    if (!o || typeof o !== 'object' || depth > 5 || seen.indexOf(o) >= 0) return null;
+    if (isTensor(o)) return { tensor: o, path: path };
+    seen.push(o);
+    var keys;
+    if (Array.isArray(o)) { keys = []; for (var i = o.length - 1; i >= 0; i--) keys.push(i); }
+    else {
+      var all = Object.keys(o);
+      keys = PRIORITY.filter(function (k) { return all.indexOf(k) >= 0; }).concat(all.filter(function (k) { return PRIORITY.indexOf(k) < 0; }));
+    }
+    for (var j = 0; j < keys.length; j++) {
+      var child; try { child = o[keys[j]]; } catch (e) { continue; }
+      var r = findTensor(child, path + '.' + keys[j], depth + 1, seen);
+      if (r) return r;
+    }
+    return null;
+  }
+  function half2float(h) {
+    var s = (h & 0x8000) >> 15, e = (h & 0x7C00) >> 10, f = h & 0x03FF;
+    if (e === 0) return (s ? -1 : 1) * Math.pow(2, -14) * (f / 1024);
+    if (e === 0x1F) return f ? NaN : (s ? -Infinity : Infinity);
+    return (s ? -1 : 1) * Math.pow(2, e - 15) * (1 + f / 1024);
+  }
+  // -> { w, h, f: Float32Array in 0..1 }
+  function tensorToMask(dims, data, type) {
+    var H = dims[dims.length - 2], W = dims[dims.length - 1], n = H * W;
+    if (!(H > 0 && W > 0) || data.length < n) throw new Error('Unusable tensor shape [' + dims.join(',') + '] with ' + data.length + ' values');
+    var f = new Float32Array(n), i, mn = Infinity, mx = -Infinity, v;
+    var isHalf = type === 'float16' || (data instanceof Uint16Array);
+    for (i = 0; i < n; i++) { v = isHalf ? half2float(data[i]) : data[i]; f[i] = v; if (v < mn) mn = v; if (v > mx) mx = v; }
+    if (type === 'uint8' || (data instanceof Uint8Array && mx > 1)) { for (i = 0; i < n; i++) f[i] = f[i] / 255; }
+    else if (mn < 0 || mx > 1) { for (i = 0; i < n; i++) f[i] = 1 / (1 + Math.exp(-f[i])); } // logits -> probability
+    return { w: W, h: H, f: f };
+  }
+  function resizeMask(m, ow, oh) {
+    var out = new Uint8Array(ow * oh), x0 = new Int32Array(ow), x1 = new Int32Array(ow), wx = new Float32Array(ow), x, y;
+    var xr = m.w / ow, yr = m.h / oh;
+    for (x = 0; x < ow; x++) { var sx = Math.max(0, (x + 0.5) * xr - 0.5), a = Math.min(m.w - 1, Math.floor(sx)); x0[x] = a; x1[x] = Math.min(m.w - 1, a + 1); wx[x] = sx - a; }
+    for (y = 0; y < oh; y++) {
+      var sy = Math.max(0, (y + 0.5) * yr - 0.5), y0 = Math.min(m.h - 1, Math.floor(sy)), y1 = Math.min(m.h - 1, y0 + 1), wy = sy - y0;
+      var r0 = y0 * m.w, r1 = y1 * m.w, o = y * ow;
+      for (x = 0; x < ow; x++) {
+        var top = m.f[r0 + x0[x]] * (1 - wx[x]) + m.f[r0 + x1[x]] * wx[x];
+        var bot = m.f[r1 + x0[x]] * (1 - wx[x]) + m.f[r1 + x1[x]] * wx[x];
+        out[o + x] = Math.round((top * (1 - wy) + bot * wy) * 255);
+      }
+    }
+    return out;
+  }
+  function compose(img, alpha) {
+    var w = img.width, h = img.height, ch = img.channels || 4, src = img.data, n = w * h;
+    if (!src || src.length < n * ch) throw new Error('Decoded image buffer does not match ' + w + 'x' + h + 'x' + ch);
+    var out = new Uint8ClampedArray(n * 4);
+    for (var i = 0, s = 0, d = 0; i < n; i++, s += ch, d += 4) {
+      if (ch >= 3) { out[d] = src[s]; out[d + 1] = src[s + 1]; out[d + 2] = src[s + 2]; }
+      else { out[d] = out[d + 1] = out[d + 2] = src[s]; }
+      out[d + 3] = ch === 4 ? Math.round(alpha[i] * src[s + 3] / 255) : alpha[i];
+    }
+    return { rgba: out, width: w, height: h };
+  }
+  function inputNames(model) {
+    try {
+      var ss = model.sessions; if (ss) { var s = ss.model || ss[Object.keys(ss)[0]]; if (s && s.inputNames) return s.inputNames; }
+      if (model.session && model.session.inputNames) return model.session.inputNames;
+    } catch (e) {}
+    return null;
+  }
+  function describe(o, d) {
+    d = d || 0; if (o === null || typeof o !== 'object') return typeof o;
+    if (isTensor(o)) return 'Tensor[' + o.dims.join(',') + ']';
+    if (d > 2) return '{...}';
+    return '{' + Object.keys(o).slice(0, 8).map(function (k) { return k + ':' + describe(o[k], d + 1); }).join(', ') + '}';
+  }
+  function tick() { return new Promise(function (r) { setTimeout(r, 0); }); }
+
+  // ---- engine ---------------------------------------------------------------
+  // cfg: { send(msg), libs (object or Promise), encodePng(rgba,w,h)->Promise<Uint8Array>, modelId, log? }
+  function createEngine(cfg) {
+    var cache = { processor: null, model: null, device: null };
+    var active = null, cancelled = false, curStage = 'idle', lastP = 0, flags = newFlags();
+    function newFlags() {
+      return { engineLoaded: true, messageReceived: false, processorLoaded: false, modelLoaded: false, inferenceStarted: false,
+        inferenceCompleted: false, tensorFound: false, maskCreated: false, pngCreated: false, resultSent: false };
+    }
+    function send(m) { m.requestId = m.requestId || active || 'engine'; cfg.send(m); }
+    function log(t) {
+      var line = '[ENGINE] ' + t;
+      try { console.log(line); } catch (e) {}
+      try { send({ type: 'engine-log', requestId: active || 'engine', line: line }); } catch (e) {}
+    }
+    function progress(p, stage) {
+      lastP = Math.max(lastP, p); curStage = stage;
+      send({ type: 'engine-progress', requestId: active, progress: lastP, stage: stage, flags: flags });
+    }
+    function check() { if (cancelled) { var e = new Error('cancelled'); e.__cancelled = true; throw e; } }
+
+    async function ensureModel(useGpu) {
+      var device = useGpu ? 'webgpu' : 'wasm';
+      if (cache.model && cache.processor && cache.device === device) { flags.processorLoaded = flags.modelLoaded = true; log('processor + model already loaded (cached)'); return; }
+      var libs = await Promise.resolve(cfg.libs);
+      if (!libs || !libs.AutoModel) throw new Error('Transformers.js is not available in the engine page' + (cfg.libsError ? ': ' + cfg.libsError : ''));
+      var lastSeen = 5;
+      function cb(p) {
+        if (p && p.status === 'progress' && typeof p.progress === 'number') {
+          var v = Math.min(10, 5 + Math.floor(5 * Math.min(100, p.progress) / 100));
+          if (v > lastSeen) { lastSeen = v; progress(v, 'loading-engine'); }
+        }
+      }
+      log('loading processor');
+      cache.processor = await libs.AutoProcessor.from_pretrained(cfg.modelId, { progress_callback: cb });
+      flags.processorLoaded = true; log('processor ready');
+      log('starting model (device=' + device + ')');
+      var attempts = useGpu
+        ? [{ device: 'webgpu', dtype: 'fp16' }, { device: 'wasm', dtype: 'fp32' }]
+        : [{ device: 'wasm', dtype: 'fp32' }];
+      attempts.push({ config: { model_type: 'custom' }, device: attempts[attempts.length - 1].device, dtype: attempts[attempts.length - 1].dtype });
+      var lastErr = null;
+      for (var i = 0; i < attempts.length; i++) {
+        try {
+          var o = Object.assign({ progress_callback: cb }, attempts[i]);
+          cache.model = await libs.AutoModel.from_pretrained(cfg.modelId, o);
+          cache.device = useGpu ? 'webgpu' : 'wasm';
+          log('model ready with ' + JSON.stringify(attempts[i])); break;
+        } catch (e) { lastErr = e; log('model load attempt ' + (i + 1) + ' failed: ' + (e && e.message)); }
+      }
+      if (!cache.model) throw lastErr || new Error('Model failed to load');
+      flags.modelLoaded = true;
+    }
+
+    async function runModel(pixel_values) {
+      var names = inputNames(cache.model), cands = [];
+      if (names && names.length) cands.push(names[0]);
+      ['input_image', 'input', 'pixel_values'].forEach(function (n) { if (cands.indexOf(n) < 0) cands.push(n); });
+      var lastErr;
+      for (var i = 0; i < cands.length; i++) {
+        try { var feed = {}; feed[cands[i]] = pixel_values; log('model input name = ' + cands[i]); return await cache.model(feed); }
+        catch (e) { lastErr = e; if (!/input|missing|name/i.test(String(e && e.message || e))) throw e; }
+      }
+      throw lastErr;
+    }
+
+    async function run(msg) {
+      var rid = active;
+      progress(5, 'received');
+      log('image payload received');
+      if (typeof msg.imageBase64 !== 'string' || !msg.imageBase64.length) throw new Error('Message has no imageBase64');
+      var bytes = b64decode(msg.imageBase64);
+      log('image bytes length = ' + bytes.length);
+      progress(5, 'loading-engine');
+      await ensureModel(msg.useGpu !== false);
+      check();
+      progress(10, 'preparing-image');
+      var libs = await Promise.resolve(cfg.libs);
+      var mime = sniffMime(bytes);
+      if (mime === 'image/tiff') throw new Error('TIFF cannot be decoded by the engine WebView. Convert the image to PNG or JPG first.');
+      log('decoding image (' + mime + ')');
+      var image = await libs.RawImage.fromBlob(new Blob([bytes], { type: mime }));
+      log('RawImage ' + image.width + 'x' + image.height + ' channels=' + image.channels);
+      progress(15, 'preparing-image');
+      log('starting processor');
+      var inputs = await cache.processor(image);
+      log('processor output keys = ' + Object.keys(inputs).join(','));
+      check();
+      flags.inferenceStarted = true;   // set BEFORE the progress event so a stall reports the truth
+      progress(25, 'inference');
+      log('starting inference');
+      var outputs = await runModel(inputs.pixel_values);
+      flags.inferenceCompleted = true; log('inference complete');
+      check();
+      progress(70, 'mask');
+      log('inspecting output: ' + describe(outputs));
+      var found = findTensor(outputs, 'outputs', 0, []);
+      if (!found) throw new Error('Inference finished but no tensor was found in the model output: ' + describe(outputs));
+      flags.tensorFound = true;
+      var t = found.tensor, data;
+      try { data = t.data; } catch (e) { data = null; }
+      if (!data && typeof t.getData === 'function') data = await t.getData();
+      log('tensor found at ' + found.path + ' dims=[' + t.dims.join(',') + '] type=' + t.type);
+      log('creating mask');
+      var mask = tensorToMask(t.dims, data, t.type);
+      var alpha = resizeMask(mask, image.width, image.height);
+      flags.maskCreated = true; progress(85, 'png');
+      log('creating PNG');
+      var comp = compose(image, alpha);
+      var png = await cfg.encodePng(comp.rgba, comp.width, comp.height);
+      flags.pngCreated = true; log('PNG created (' + png.length + ' bytes)');
+      check();
+      progress(95, 'sending-result');
+      log('sending result');
+      var chunks = Math.ceil(png.length / CHUNK_RAW);
+      send({ type: 'engine-result-start', requestId: rid, totalBytes: png.length, totalChunks: chunks, width: comp.width, height: comp.height, flags: flags });
+      for (var i = 0; i < chunks; i++) {
+        send({ type: 'engine-result-chunk', requestId: rid, chunkIndex: i, data: b64encode(png.subarray(i * CHUNK_RAW, (i + 1) * CHUNK_RAW)) });
+        if (chunks > 1) progress(95 + Math.floor(4 * (i + 1) / chunks), 'sending-result');
+        await tick();
+      }
+      flags.resultSent = true;
+      send({ type: 'engine-result-end', requestId: rid, flags: flags });
+      log('result sent');
+    }
+
+    var chain = Promise.resolve(), pendingCancel = {};
+    async function runRequest(msg) {
+      var rid = msg.requestId;
+      if (pendingCancel[rid]) { delete pendingCancel[rid]; log('request ' + rid + ' was cancelled before it started'); cfg.send({ type: 'engine-cancelled', requestId: rid, stage: 'queued', flags: flags }); return; }
+      active = rid; cancelled = false; lastP = 0; curStage = 'received'; flags = newFlags(); flags.messageReceived = true;
+      try { await run(msg); }
+      catch (e) {
+        if (e && e.__cancelled) { log('cancelled at stage ' + curStage); send({ type: 'engine-cancelled', requestId: rid, stage: curStage, flags: flags }); }
+        else {
+          log('ERROR at stage ' + curStage + ': ' + (e && e.message));
+          send({ type: 'engine-error', requestId: rid, message: String(e && e.message || e), stack: String(e && e.stack || ''), stage: curStage, flags: flags });
+        }
+      } finally { active = null; }
+    }
+    function handle(msg) {
+      if (!msg || typeof msg !== 'object') return Promise.resolve();
+      log('received message'); log('message type = ' + msg.type);
+      if (msg.type === 'cancel') { if (active && active === msg.requestId) cancelled = true; else if (msg.requestId) pendingCancel[msg.requestId] = true; return Promise.resolve(); }
+      if (msg.type === 'ping') { send({ type: 'engine-pong', requestId: msg.requestId || 'engine' }); return Promise.resolve(); }
+      if (msg.type !== 'process-background-removal') { log('ignoring unknown message type'); return Promise.resolve(); }
+      if (!msg.requestId) { cfg.send({ type: 'engine-error', requestId: 'unknown', message: 'Message has no requestId' }); return Promise.resolve(); }
+      chain = chain.then(function () { return runRequest(msg); });
+      return chain;
+    }
+    log('module initialized');
+    return { handle: handle, _internals: { cache: cache } };
+  }
+
+  // Browser/WebView wiring: installs listeners, announces engine-ready, answers host pings.
+  // The announce is retried until the host is heard from, so a late-injected uxpHost or a late host listener cannot break the handshake.
+  function attach(cfg) {
+    var R = cfg.root || root, sentVia = null, hostSeen = false, announced = 0;
+    function status(t) { try { console.log('[ENGINE] ' + t); if (cfg.onStatus) cfg.onStatus(t); } catch (e) {} }
+    function send(m) {
+      var s = JSON.stringify(m);
+      if (R.uxpHost && typeof R.uxpHost.postMessage === 'function') { R.uxpHost.postMessage(s); sentVia = 'uxpHost'; }
+      else if (R.parent && R.parent !== R) { R.parent.postMessage(s, '*'); sentVia = 'parent'; }
+      else throw new Error('No channel to host (window.uxpHost and window.parent are missing)');
+    }
+    cfg.send = send;
+    var engine = createEngine(cfg), seen = {};
+    function announce(reason) {
+      try {
+        send({ type: 'engine-ready', requestId: 'engine', reason: reason, channel: sentVia, ua: (R.navigator && R.navigator.userAgent) || '', webgpu: !!(R.navigator && R.navigator.gpu) });
+        announced++; status('Online. Announced to host via ' + sentVia + ' (#' + announced + ', ' + reason + ').'); return true;
+      } catch (e) { status('Cannot reach host yet: ' + e.message); return false; }
+    }
+    function onMsg(via) {
+      return function (e) {
+        var d = e && e.data; if (typeof d === 'string') { try { d = JSON.parse(d); } catch (x) { return; } }
+        if (!d || typeof d !== 'object') return;
+        hostSeen = true;
+        if (d.type === 'ping') { status('Ping received via ' + via); announce('ping-reply'); return; }
+        var key = d.type + ':' + d.requestId;
+        if (d.type === 'process-background-removal') { if (seen[key]) return; seen[key] = 1; }
+        status('Message "' + d.type + '" received via ' + via);
+        engine.handle(d);
+      };
+    }
+    R.addEventListener('message', onMsg('window'));
+    if (R.document && R.document.addEventListener) R.document.addEventListener('message', onMsg('document'));
+    status('Message listener installed.');
+    announce('startup');
+    var n = 0, t = setInterval(function () { if (hostSeen || ++n > 90) { clearInterval(t); return; } announce('retry'); }, 1000);
+    return engine;
+  }
+
+  return { createEngine: createEngine, attach: attach, findTensor: findTensor, tensorToMask: tensorToMask, resizeMask: resizeMask,
+    b64encode: b64encode, b64decode: b64decode, half2float: half2float, CHUNK_RAW: CHUNK_RAW };
+});
+
+</script>
+<script>
+  console.log('[ENGINE] script loaded');
+  var statusEl = document.getElementById('s');
+  function setStatus(t) { statusEl.textContent = t; }
+
+  // Library loading is asynchronous and separate from messaging: if the CDN import fails,
+  // the engine still answers with a precise error instead of staying silent.
+  var cfg = {
+    modelId: 'studioludens/birefnet-lite-512',
+    libs: null, libsError: '',
+    encodePng: async function (rgba, w, h) {
+      var c;
+      if (typeof OffscreenCanvas !== 'undefined') c = new OffscreenCanvas(w, h);
+      else { c = document.createElement('canvas'); c.width = w; c.height = h; }
+      c.getContext('2d').putImageData(new ImageData(rgba, w, h), 0, 0);
+      var blob = c.convertToBlob ? await c.convertToBlob({ type: 'image/png' })
+                                 : await new Promise(function (r) { c.toBlob(r, 'image/png'); });
+      if (!blob) throw new Error('Canvas could not encode PNG (image too large?)');
+      return new Uint8Array(await blob.arrayBuffer());
+    }
+  };
+  cfg.libs = new Promise(function (resolve) { window.__resolveLibs = resolve; });
+  cfg.onStatus = setStatus;
+  var engine = AIS_ENGINE_CORE.attach(cfg);
+</script>
+<!-- 2) module script: loads Transformers.js from jsDelivr and resolves the libs promise -->
+<script type="module">
+  try {
+    const T = await import('https://cdn.jsdelivr.net/npm/@huggingface/transformers@3/+esm');
+    T.env.allowLocalModels = false;
+    T.env.useBrowserCache = true;
+    console.log('[ENGINE] Transformers.js imported');
+    document.getElementById('s').textContent = 'Engine ready (Transformers.js loaded).';
+    window.__resolveLibs({ AutoProcessor: T.AutoProcessor, AutoModel: T.AutoModel, RawImage: T.RawImage });
+  } catch (e) {
+    console.log('[ENGINE] Transformers.js import FAILED: ' + e.message);
+    document.getElementById('s').textContent = 'Transformers.js failed to load: ' + e.message;
+    window.__resolveLibs(null);
+  }
+</script>
+</body>
+</html>
