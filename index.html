@@ -141,6 +141,19 @@
     if (d > 2) return '{...}';
     return '{' + Object.keys(o).slice(0, 8).map(function (k) { return k + ':' + describe(o[k], d + 1); }).join(', ') + '}';
   }
+  // Tolerant decoder: accepts a message object, a JSON string, a DOUBLE-encoded JSON string, or an event/wrapper
+  // ({data|message|payload|detail|body: ...}) around any of those. Returns the protocol object or null.
+  var PROTO = /^(engine-|ping$|pong$|process-|cancel$)/;
+  function decode(x, depth) {
+    depth = depth || 0; if (depth > 6 || x == null) return null;
+    if (typeof x === 'string') { var t = x.trim(); if (!t) return null; try { return decode(JSON.parse(t), depth + 1); } catch (e) { return null; } }
+    if (typeof x === 'object') {
+      if (typeof x.type === 'string' && PROTO.test(x.type)) return x;
+      var ks = ['data', 'message', 'payload', 'detail', 'body'];
+      for (var i = 0; i < ks.length; i++) { var v; try { v = x[ks[i]]; } catch (e) { v = null; } if (v != null) { var r = decode(v, depth + 1); if (r) return r; } }
+    }
+    return null;
+  }
   function tick() { return new Promise(function (r) { setTimeout(r, 0); }); }
 
   // ---- engine ---------------------------------------------------------------
@@ -318,8 +331,8 @@
     }
     function onMsg(via) {
       return function (e) {
-        var d = e && e.data; if (typeof d === 'string') { try { d = JSON.parse(d); } catch (x) { return; } }
-        if (!d || typeof d !== 'object') return;
+        var d = decode(e && e.data !== undefined ? e.data : e);
+        if (!d) { status('Undecodable message via ' + via); return; }
         hostSeen = true;
         if (d.type === 'ping') { status('Ping received via ' + via); announce('ping-reply'); return; }
         var key = d.type + ':' + d.requestId;
@@ -337,7 +350,7 @@
   }
 
   return { createEngine: createEngine, attach: attach, findTensor: findTensor, tensorToMask: tensorToMask, resizeMask: resizeMask,
-    b64encode: b64encode, b64decode: b64decode, half2float: half2float, CHUNK_RAW: CHUNK_RAW };
+    decode: decode, b64encode: b64encode, b64decode: b64decode, half2float: half2float, CHUNK_RAW: CHUNK_RAW };
 });
 
 </script>
