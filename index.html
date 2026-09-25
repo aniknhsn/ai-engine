@@ -262,7 +262,15 @@
       log('creating mask');
       var mask = tensorToMask(t.dims, data, t.type);
       var alpha = resizeMask(mask, image.width, image.height);
-      flags.maskCreated = true; progress(85, 'png');
+      flags.maskCreated = true;
+      (function () { // diagnostic only: never changes the result, just reports what the mask actually looks like
+        var n = alpha.length, sum = 0, lo = 0, hi = 0, mn = 255, mx = 0;
+        for (var i = 0; i < n; i++) { var v = alpha[i]; sum += v; if (v < mn) mn = v; if (v > mx) mx = v; if (v < 25) lo++; else if (v > 230) hi++; }
+        var mean = (sum / n).toFixed(1), loPct = Math.round(100 * lo / n), hiPct = Math.round(100 * hi / n), midPct = 100 - loPct - hiPct;
+        log('mask stats: min=' + mn + ' max=' + mx + ' mean=' + mean + ' | fully-transparent=' + loPct + '% fully-opaque=' + hiPct + '% in-between=' + midPct + '%' +
+          (midPct > 60 ? '  <-- mask is mostly mid-range: likely NOT a clean cutout (wrong tensor, or model needs a different input size/normalization)' : ''));
+      })();
+      progress(85, 'png');
       log('creating PNG');
       var comp = compose(image, alpha);
       var png = await cfg.encodePng(comp.rgba, comp.width, comp.height);
